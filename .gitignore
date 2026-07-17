@@ -1,0 +1,30 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+effi-modeling-env/
+
+# Generated outputs
+outputs/
+
+# Solver-generated files
+*.lp
+*.sol
+*.mps
+*.log
+
+# Environment and secret files
+.env
+.env.*
+
+# VS Code and IDE metadata
+.vscode/
+.idea/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
