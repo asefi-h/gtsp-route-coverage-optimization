@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 # ------------------------------------------------------------------
 # The runner is stored inside HeuSolve, while the data generator is
 # stored in the parent project directory.
-# these imports, so noqa: E402 suppresses the intentional import-order warning (linter pupose).
+# these imports, so noqa: E402 suppresses the intentional import-order warning (Linter pupose).
 CURRENT_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_DIRECTORY = CURRENT_DIRECTORY.parent
 
@@ -27,12 +27,24 @@ from generate_random_gtsp_data import (  # noqa: E402
     DEFAULT_NUM_CELLS,
     generate_random_gtsp_instance,
 )
-from hybrid_ga_dp_engine import (  # noqa: E402
-    GAConfig,
-    GAResult,
-    build_node_index_map,
-    run_ga_gtsp,
-)
+try:
+    # Package import used when this runner is imported by the
+    # repository-level orchestration pipeline.
+    from .hybrid_ga_dp_engine import (  # noqa: E402
+        GAConfig,
+        GAResult,
+        build_node_index_map,
+        run_ga_gtsp,
+    )
+
+except ImportError:
+    # Standalone import used when this file is executed directly.
+    from hybrid_ga_dp_engine import (  # noqa: E402
+        GAConfig,
+        GAResult,
+        build_node_index_map,
+        run_ga_gtsp,
+    )
 
 
 # ------------------------------------------------------------------
@@ -253,13 +265,50 @@ def write_run_log(
 # ------------------------------------------------------------------
 # Main execution
 # ------------------------------------------------------------------
-def main() -> None:
-    """Generate an instance, run GA-DP, and report the solution."""
+def main(
+    data: dict | None = None,
+    number_of_cells: int = DEFAULT_NUM_CELLS,
+    instance_seed: int = 1234,
+    ga_seed: int = 1,
+    ga_config: GAConfig | None = None,
+) -> dict:
+    """Run GA-DP from supplied data or generate an instance."""
 
     run_start = datetime.now()
     total_start_time = perf_counter()
+    
+    # Structured result returned to the orchestration pipeline.
+    # Values are populated during execution and remain available
+    # for both successful and failed runs.
+    run_summary = {
+        "method": "ga_dp",
+        "solver": None,
+        "number_of_cells": None,
+        "number_of_options": None,
+        "instance_seed": instance_seed,
+        "ga_seed": ga_seed,
+        "objective_value": None,
+        "solver_wall_time": None,
+        "total_wall_time": None,
+        "termination_condition": "not started",
+        "route_nodes": [],
+        "best_permutation": [],
+        "population_size": None,
+        "number_of_generations": None,
+        "crossover_rate": None,
+        "mutation_rate": None,
+        "number_of_elites": None,
+        "tournament_size": None,
+        "log_file": None,
+        "convergence_plot_file": None,
+        "run_status": "started",
+    }
 
-    number_of_cells = DEFAULT_NUM_CELLS
+    # When a shared instance is supplied by the orchestration pipeline,
+    # derive the problem size directly from that instance. Otherwise,
+    # retain the requested standalone-run cell count.
+    if data is not None:
+        number_of_cells = len(data["cells"])
 
     log_lines = [
         "Hybrid GA-DP Run Summary",
@@ -279,13 +328,23 @@ def main() -> None:
         # ----------------------------------------------------------
         print("1/4 Generating GTSP instance...")
 
-        data = generate_random_gtsp_instance(
-            num_cells=number_of_cells,
-        )
+        # Generate an instance only for standalone execution.
+        # When the orchestration pipeline supplies shared data, use that
+        # instance unchanged so MILP and GA-DP solve the same problem.
+        if data is None:
+            data = generate_random_gtsp_instance(
+                num_cells=number_of_cells,
+                random_seed=instance_seed,
+            )
 
         number_of_options = len(data["options"])
         number_of_nodes = len(data["nodes"])
         number_of_arcs = len(data["edges"])
+        
+        # Record the final instance dimensions used by this run.
+        # This supports both standalone-generated and pipeline-supplied data.
+        run_summary["number_of_cells"] = len(data["cells"])
+        run_summary["number_of_options"] = number_of_options
 
         print(
             f"    Generated {number_of_nodes} nodes "
@@ -306,7 +365,38 @@ def main() -> None:
         # ----------------------------------------------------------
         print("2/4 Building hybrid GA-DP configuration...")
 
-        config = build_ga_config(number_of_cells)
+        # Use an externally supplied GA configuration when provided.
+        # Otherwise, build the default configuration for the current
+        # problem size and apply the requested GA random seed.
+        if ga_config is None:
+            # Build the default size-based configuration first, then create
+            # a new immutable GAConfig with the requested random seed.
+            default_config = build_ga_config(number_of_cells)
+        
+            config = GAConfig(
+                population_size=default_config.population_size,
+                num_generations=default_config.num_generations,
+                crossover_rate=default_config.crossover_rate,
+                mutation_rate=default_config.mutation_rate,
+                num_elites=default_config.num_elites,
+                tournament_size=default_config.tournament_size,
+                random_seed=ga_seed,
+                print_progress=default_config.print_progress,
+                progress_interval=default_config.progress_interval,
+            )
+        else:
+            config = ga_config
+            
+        # Record the exact GA configuration used for this run.
+        # These values support reproducibility and later comparison
+        # across problem sizes and random seeds.
+        run_summary["ga_seed"] = config.random_seed
+        run_summary["population_size"] = config.population_size
+        run_summary["number_of_generations"] = config.num_generations
+        run_summary["crossover_rate"] = config.crossover_rate
+        run_summary["mutation_rate"] = config.mutation_rate
+        run_summary["number_of_elites"] = config.num_elites
+        run_summary["tournament_size"] = config.tournament_size
 
         print(
             f"    Population: {config.population_size}, "
@@ -346,6 +436,16 @@ def main() -> None:
             data,
             config,
         )
+        
+        # Store the final GA-DP solution and solver-level runtime for
+        # pipeline reporting and later computational comparison.
+        run_summary["objective_value"] = float(result.best_cost)
+        run_summary["solver_wall_time"] = result.elapsed_time
+        run_summary["termination_condition"] = (
+            "generation limit reached"
+        )
+        run_summary["route_nodes"] = result.route_nodes
+        run_summary["best_permutation"] = result.best_permutation
 
         log_lines.extend(
             [
@@ -388,10 +488,21 @@ def main() -> None:
             run_start,
             OUTPUT_CONFIG,
         )
+        
+        # Link the structured run summary to the convergence plot
+        # generated for this specific GA-DP execution.
+        run_summary["convergence_plot_file"] = (
+            str(plot_path)
+            if plot_path is not None
+            else None
+        )
+
+        # Report the saved convergence-plot path for direct verification.
+        if plot_path is not None:
+            print(f"Convergence plot saved to: {plot_path}")
 
         log_lines.extend(
             [
-                "Run status: completed",
                 (
                     "Convergence plot saved: "
                     f"{plot_path is not None}"
@@ -415,9 +526,25 @@ def main() -> None:
         )
 
         print(f"\nHybrid GA-DP run failed: {error}")
+        
+        # Preserve failure details for the orchestration pipeline.
+        run_summary["run_status"] = "failed"
+        run_summary["termination_condition"] = "failed"
+        run_summary["error_type"] = type(error).__name__
+        run_summary["error_message"] = str(error)
+        
+    else:
+        log_lines.append("Run status: completed")
+    
+        # Mark the run as completed only when the main execution block
+        # finishes without raising an exception.
+        run_summary["run_status"] = "completed"
 
     finally:
         total_wall_time = perf_counter() - total_start_time
+        # Store the complete end-to-end runtime, including instance
+        # preparation, GA-DP execution, reporting, and output generation.
+        run_summary["total_wall_time"] = total_wall_time
 
         log_lines.append(
             f"Total wall time: {total_wall_time:.4f} seconds"
@@ -428,10 +555,20 @@ def main() -> None:
             OUTPUT_CONFIG,
             run_start,
         )
+        
+        # Link the structured run summary to its detailed text log.
+        run_summary["log_file"] = (
+            str(log_path)
+            if log_path is not None
+            else None
+        )
 
         if log_path is not None:
             print(f"\nRun log saved to: {log_path}")
-
+            
+    # Return the structured result to the orchestration pipeline.
+    # Standalone execution may ignore this value.
+    return run_summary
 
 if __name__ == "__main__":
     main()

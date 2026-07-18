@@ -165,27 +165,37 @@ def build_gtsp_model(data: dict[str, Any]) -> pyo.ConcreteModel:
 # ------------------------------------------------------------------
 # Solver selection
 # ------------------------------------------------------------------
-def select_solver():
-    """Return the single active solver wrapper and its catalog name."""
+def select_solver(
+    requested_solver: str | None = None,
+):
+    """Return the requested or catalog-selected solver wrapper."""
 
-    active_solvers = [
-        name
-        for name, is_active in SOLVER_SWITCHES.items()
-        if is_active
-    ]
+    if requested_solver is not None:
+        solver_name = requested_solver.lower()
 
-    if len(active_solvers) != 1:
-        raise RuntimeError(
-            "Exactly one supported solver must be active in "
-            "SOLVER_SWITCHES."
-        )
+    else:
+        active_solvers = [
+            name
+            for name, is_active in SOLVER_SWITCHES.items()
+            if is_active
+        ]
 
-    solver_name = active_solvers[0]
+        if len(active_solvers) != 1:
+            raise RuntimeError(
+                "Exactly one supported solver must be active in "
+                "SOLVER_SWITCHES."
+            )
+
+        solver_name = active_solvers[0]
 
     if solver_name not in SOLVER_FUNCTIONS:
+        supported_solvers = ", ".join(
+            sorted(SOLVER_FUNCTIONS)
+        )
+
         raise RuntimeError(
-            f"No execution wrapper is defined for solver "
-            f"'{solver_name}'."
+            f"Unsupported solver '{solver_name}'. "
+            f"Supported solvers: {supported_solvers}."
         )
 
     return solver_name, SOLVER_FUNCTIONS[solver_name]
@@ -473,21 +483,51 @@ def get_model_statistics(model) -> dict[str, int]:
 # ------------------------------------------------------------------
 # Main execution
 # ------------------------------------------------------------------
-def main():
-    """Generate an instance, build the MILP, solve it, and report results."""
+def main(
+    data: dict[str, Any] | None = None,
+    num_cells: int = DEFAULT_NUM_CELLS,
+    instance_seed: int = 1234,
+    solver_name: str | None = None,
+):
+    """Run the MILP from supplied data or generate an instance."""
 
     run_start = datetime.now()
     total_start_time = perf_counter()
-
-    num_cells = DEFAULT_NUM_CELLS
+    
+    # Structured result returned to the orchestration pipeline.
+    # Values are populated as the run progresses and remain available
+    # even when the solver fails or no feasible solution is found.
+    run_summary = {
+        "method": "milp",
+        "solver": None,
+        "number_of_cells": None,
+        "number_of_options": None,
+        "instance_seed": instance_seed,
+        "objective_value": None,
+        "solver_wall_time": None,
+        "total_wall_time": None,
+        "termination_condition": "not started",
+        "relative_gap": None,
+        "route_nodes": [],
+        "log_file": None,
+        "run_status": "started",
+    }
+    
+    # When a pre-generated instance is supplied by the orchestration
+    # pipeline, derive the problem size directly from that instance.
+    # Otherwise, retain the requested standalone-run cell count.
+    if data is not None:
+        num_cells = len(data["cells"])
+    
     log_lines = [
         "GTSP MILP Run Summary",
         f"Run start time: {run_start.isoformat(timespec='seconds')}",
         f"Number of cells: {num_cells}",
+        f"Instance seed: {instance_seed}",
     ]
-
+    
     prepare_output_directories(SOLVER_PARAMS)
-
+    
     print("\n========== GTSP MILP RUN ==========")
     print(f"Number of cells: {num_cells}")
 
@@ -497,12 +537,21 @@ def main():
         # ----------------------------------------------------------
         print("1/4 Generating GTSP instance...")
 
-        data = generate_random_gtsp_instance(
-            num_cells=num_cells,
-        )
-
+        # Generate an instance only for standalone execution.
+        # A shared instance supplied by the pipeline is used unchanged so
+        # the MILP and GA-DP engines solve exactly the same problem.
+        if data is None:
+            data = generate_random_gtsp_instance(
+                num_cells=num_cells,
+                random_seed=instance_seed,
+            )
         num_nodes = len(data["nodes"])
         num_arcs = len(data["edges"])
+        
+        # Record the final instance dimensions used by this run.
+        # This works for both standalone-generated and pipeline-supplied data.
+        run_summary["number_of_cells"] = len(data["cells"])
+        run_summary["number_of_options"] = len(data["options"])
 
         print(
             f"    Generated {num_nodes} nodes "
@@ -552,7 +601,11 @@ def main():
         # ----------------------------------------------------------
         # Solver execution
         # ----------------------------------------------------------
-        solver_name, solve_function = select_solver()
+        solver_name, solve_function = select_solver(
+            solver_name,
+        )
+        # Store the actual solver selected for this run.
+        run_summary["solver"] = solver_name
 
         print(f"3/4 Solving with {solver_name.upper()}...")
         log_lines.append(f"Selected solver: {solver_name}")
@@ -566,6 +619,10 @@ def main():
 
         solve_wall_time = perf_counter() - solve_start_time
         termination_condition = get_termination_condition(result)
+        
+        # Record solver execution information for downstream comparison.
+        run_summary["solver_wall_time"] = solve_wall_time
+        run_summary["termination_condition"] = termination_condition
 
         log_lines.extend(
             [
@@ -599,6 +656,12 @@ def main():
                 objective_value,
                 termination_condition,
             )
+            
+            # Store the final feasible MILP solution for pipeline-level
+            # reporting, CSV output, and comparison with the GA-DP result.
+            run_summary["objective_value"] = float(objective_value)
+            run_summary["relative_gap"] = relative_gap
+            run_summary["route_nodes"] = route_nodes
 
             log_lines.append("Feasible solution found: yes")
             log_lines.append(
@@ -657,12 +720,25 @@ def main():
         )
 
         print(f"\nMILP run failed: {error}")
+        
+        # Preserve failure information for the orchestration pipeline.
+        run_summary["run_status"] = "failed"
+        run_summary["termination_condition"] = "failed"
+        run_summary["error_type"] = type(error).__name__
+        run_summary["error_message"] = str(error)
 
     else:
         log_lines.append("Run status: completed")
+        # Mark the run as completed only when the main execution block
+        # finishes without raising an exception.
+        run_summary["run_status"] = "completed"
 
     finally:
         total_wall_time = perf_counter() - total_start_time
+        
+        # Store the complete end-to-end runtime, including instance
+        # preparation, model construction, solver execution, and reporting.
+        run_summary["total_wall_time"] = total_wall_time
 
         log_lines.extend(
             [
@@ -691,9 +767,20 @@ def main():
             SOLVER_PARAMS,
             run_start,
         )
+        
+        # Link the structured run summary to its detailed text log.
+        run_summary["log_file"] = (
+            str(log_path)
+            if log_path is not None
+            else None
+        )
 
         if log_path is not None:
             print(f"\nRun log saved to: {log_path}")
+            
+    # Return the structured result to the orchestration pipeline.
+    # Standalone execution may ignore this value.
+    return run_summary
 
 
 if __name__ == "__main__":
