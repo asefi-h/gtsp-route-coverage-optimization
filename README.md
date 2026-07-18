@@ -1,4 +1,5 @@
 # Route Coverage Optimization for Autonomous Agricultural Vehicles
+[![CI](https://github.com/asefi-h/gtsp-route-coverage-optimization/actions/workflows/ci.yml/badge.svg)](https://github.com/asefi-h/gtsp-route-coverage-optimization/actions/workflows/ci.yml)
 
 This repository presents a case study on route coverage optimization for autonomous agricultural vehicles using two solution approaches:
 
